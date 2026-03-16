@@ -1,0 +1,88 @@
+workflow:
+  rules:
+    - if: '$CI_PIPELINE_SOURCE == "merge_request_event"'
+    - if: '$CI_COMMIT_BRANCH'
+
+stages:
+  - build
+  - test
+  - deploy
+
+default:
+  image: docker:24
+  retry: 1
+  interruptible: true
+
+variables:
+  IMAGE_NAME: myapp
+  PORT: "8080"
+  LOCAL_REGISTRY: localhost:5000
+
+build-image:
+  stage: build
+  script:
+    - docker build -f Dockerfile
+        -t $LOCAL_REGISTRY/$IMAGE_NAME:sha-$CI_COMMIT_SHORT_SHA
+        -t $LOCAL_REGISTRY/$IMAGE_NAME:$CI_COMMIT_REF_SLUG
+        .
+    - docker push $LOCAL_REGISTRY/$IMAGE_NAME:sha-$CI_COMMIT_SHORT_SHA
+    - docker push $LOCAL_REGISTRY/$IMAGE_NAME:$CI_COMMIT_REF_SLUG
+    - |
+      cat > build.env <<EOF
+      IMAGE_TAG=sha-$CI_COMMIT_SHORT_SHA
+      IMAGE_NAME=$IMAGE_NAME
+      FULL_IMAGE_REF=$LOCAL_REGISTRY/$IMAGE_NAME:sha-$CI_COMMIT_SHORT_SHA
+      EOF
+  artifacts:
+    reports:
+      dotenv: build.env
+  cache:
+    key: $CI_PROJECT_ID-$CI_COMMIT_REF_SLUG-requirements
+    paths:
+      - .venv/
+    policy: pull-push
+
+test-unit:
+  stage: test
+  image: $FULL_IMAGE_REF
+  script:
+    - if [ -z "$FULL_IMAGE_REF" ]; then echo "ERROR: FULL_IMAGE_REF is not set"; exit 1; fi
+    - pip install -r requirements-dev.txt
+    - pytest --junitxml=reports/junit.xml
+  artifacts:
+    reports:
+      junit: reports/junit.xml
+    expire_in: 30 days
+    when: always
+  needs:
+    - build-image
+
+deploy-staging:
+  stage: deploy
+  script:
+    - if [ -z "$IMAGE_TAG" ] || [ -z "$FULL_IMAGE_REF" ]; then echo "ERROR: IMAGE_TAG or FULL_IMAGE_REF is not set"; exit 1; fi
+    - echo "[deploy] environment=staging image=$FULL_IMAGE_REF"
+    - IMAGE_NAME=$IMAGE_NAME IMAGE_TAG=$IMAGE_TAG docker compose -f docker-compose.staging.yml up -d
+  environment:
+    name: staging
+    action: start
+  rules:
+    - if: '$CI_COMMIT_BRANCH == "main" && $CI_PIPELINE_SOURCE != "merge_request_event"'
+  needs:
+    - test-unit
+
+deploy-production:
+  stage: deploy
+  when: manual
+  script:
+    - if [ -z "$IMAGE_TAG" ] || [ -z "$FULL_IMAGE_REF" ]; then echo "ERROR: IMAGE_TAG or FULL_IMAGE_REF is not set"; exit 1; fi
+    - echo "[deploy] environment=production image=$FULL_IMAGE_REF"
+    - IMAGE_NAME=$IMAGE_NAME IMAGE_TAG=$IMAGE_TAG docker compose -f docker-compose.production.yml up -d
+  environment:
+    name: production
+    action: start
+  rules:
+    - if: '$CI_COMMIT_BRANCH == "main" && $CI_PIPELINE_SOURCE != "merge_request_event"'
+      when: manual
+  needs:
+    - deploy-staging

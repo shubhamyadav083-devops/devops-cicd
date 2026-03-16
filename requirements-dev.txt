@@ -1,0 +1,5 @@
+pytest
+hypothesis
+requests
+pyyaml
+flask
